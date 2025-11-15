@@ -83,4 +83,8 @@ jobs:
             -H "Content-Type: application/json" \
             -d '{
               "status": "'"$STATUS"'",
-              "commit": "'${{ github.sh
+              "commit": "'${{ github.sha }}'",
+              "branch": "'${{ github.ref_name }}'",
+              "triggered_by": "'${{ github.actor }}'",
+              "timestamp": "'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'"
+            }'
