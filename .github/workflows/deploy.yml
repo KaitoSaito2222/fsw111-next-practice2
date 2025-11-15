@@ -1,76 +1,86 @@
 name: Deploy to EC2
 
+# Trigger: Runs automatically when code is pushed to main branch
 on:
   push:
     branches:
       - main
 
+# Required permissions for GitHub Container Registry
 permissions:
-  contents: read
-  packages: write
+  contents: read      # Read repository contents
+  packages: write     # Push Docker images to GHCR
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
     
     steps:
+      # Step 1: Checkout repository code
       - uses: actions/checkout@v3
       
+      # Step 2: Login to GitHub Container Registry (GHCR)
       - name: Login to GitHub Container Registry
-        run: echo ${{ secrets.GHCR_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}           # GitHub username
+          password: ${{ secrets.GHCR_TOKEN }}     # Personal Access Token
       
+      # Step 3: Generate Docker image tags and metadata
+      # Automatically converts repository name to lowercase
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha      # Tag with commit SHA (e.g., sha-abc123)
+            type=raw,value=latest   # Tag with 'latest'
+      
+      # Step 4: Build Docker image and push to GHCR
       - name: Build and push
-        run: |
-          IMAGE=ghcr.io/${{ github.repository }}:${{ github.sha }}
-          docker build -t $IMAGE .
-          docker push $IMAGE
-          docker tag $IMAGE ghcr.io/${{ github.repository }}:latest
-          docker push ghcr.io/${{ github.repository }}:latest
+        uses: docker/build-push-action@v5
+        with:
+          context: .                              # Build from current directory
+          push: true                              # Push to registry after build
+          tags: ${{ steps.meta.outputs.tags }}    # Use tags from metadata step
 
+      # Step 5: Deploy to EC2 via SSH
       - name: Deploy to EC2
         uses: appleboy/ssh-action@master
         with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USERNAME }}
-          key: ${{ secrets.EC2_SSH_KEY }}
+          host: ${{ secrets.EC2_HOST }}           # EC2 public IP
+          username: ${{ secrets.EC2_USERNAME }}   # SSH username (ubuntu)
+          key: ${{ secrets.EC2_SSH_KEY }}         # Private SSH key (.pem file)
           script: |
-            if ! command -v docker &> /dev/null; then
-              sudo apt-get update
-              sudo apt-get install -y docker.io
-              sudo systemctl start docker
-              sudo systemctl enable docker
-              sudo usermod -aG docker ubuntu
-            fi
+            # Convert repository name to lowercase for Docker
+            REPO_LOWER=$(echo "ghcr.io/${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
             
+            # Login to GHCR on EC2
             echo ${{ secrets.GHCR_TOKEN }} | sudo docker login ghcr.io -u ${{ github.actor }} --password-stdin
-            sudo docker pull ghcr.io/${{ github.repository }}:latest
-            sudo docker stop my-next-project || true && sudo docker rm my-next-project || true
-            sudo docker run -d --name my-next-project -p 80:3000 ghcr.io/${{ github.repository }}:latest
+            
+            # Pull latest Docker image
+            sudo docker pull ${REPO_LOWER}:latest
+            
+            # Stop and remove old container (if exists)
+            sudo docker stop my-next-project || true
+            sudo docker rm my-next-project || true
+            
+            # Run new container on port 80 (maps to container port 3000)
+            sudo docker run -d --name my-next-project -p 80:3000 ${REPO_LOWER}:latest
 
+      # Step 6: Send deployment status to AWS Lambda for logging
       - name: Send status to AWS Lambda
-        if: always()
+        if: always()    # Always run, even if previous steps fail
         run: |
-          # Determine deployment status
+          # Determine deployment status (success or failed)
           STATUS="success"
-          if [ "${{ job.status }}" != "success" ]; then
-            STATUS="failed"
-          fi
+          [ "${{ job.status }}" != "success" ] && STATUS="failed"
           
-          # Gather metadata
-          COMMIT_SHA="${{ github.sha }}"
-          BRANCH="${{ github.ref_name }}"
-          ACTOR="${{ github.actor }}"
-          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          
-          # Send log to CloudWatch via Lambda
-          RESPONSE=$(curl -s -X POST ${{ secrets.LAMBDA_URL }} \
+          # Send POST request to Lambda with deployment metadata
+          curl -s -X POST ${{ secrets.LAMBDA_URL }} \
             -H "Content-Type: application/json" \
             -d '{
               "status": "'"$STATUS"'",
-              "commit": "'"$COMMIT_SHA"'",
-              "branch": "'"$BRANCH"'",
-              "triggered_by": "'"$ACTOR"'",
-              "timestamp": "'"$TIMESTAMP"'"
-            }')
-          
-          echo "Lambda Response: $RESPONSE"
+              "commit": "'${{ github.sh
